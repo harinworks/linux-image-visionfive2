@@ -1,0 +1,130 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - ref: JH7110_VF2_6.12_v6.0.0
+            config: starfive_visionfive2_defconfig
+            localversion: -starfive
+
+    env:
+      ARCH: riscv
+      CROSS_COMPILE: riscv64-linux-gnu-
+      KCFLAGS: -Wno-error -Wno-implicit-function-declaration -Wno-implicit-int -Wno-return-type -Wno-strict-prototypes
+
+    steps:
+      - name: install-dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install \
+            build-essential gcc-riscv64-linux-gnu \
+            bc kmod cpio flex libncurses5-dev libelf-dev libssl-dev dwarves bison \
+            git
+
+      - name: checkout
+        uses: actions/checkout@v6
+
+      - name: checkout-linux
+        uses: actions/checkout@v6
+        with:
+          repository: starfive-tech/linux
+          ref: ${{ matrix.ref }}
+          path: linux
+
+      - name: checkout-extra
+        uses: actions/checkout@v6
+        with:
+          repository: starfive-tech/soft_3rdpart
+          ref: ${{ matrix.ref }}
+          path: soft_3rdpart
+
+      - name: set-envs
+        run: |
+          echo "LOCALVERSION=${{ matrix.localversion }}" >> "$GITHUB_ENV"
+          echo "LINUX_DIR=${{ github.workspace }}/linux" >> "$GITHUB_ENV"
+          echo "EXTRA_DIR=${{ github.workspace }}/soft_3rdpart" >> "$GITHUB_ENV"
+          echo "LINUX_OUT_DIR=${{ github.workspace }}/linux-image" >> "$GITHUB_ENV"
+          echo "EXTRA_OUT_DIR=${{ github.workspace }}/linux-extra" >> "$GITHUB_ENV"
+
+      - name: build-linux
+        id: linux
+        run: |
+          mv "${{ matrix.config }}" "${{ env.LINUX_DIR }}/.config"
+          cd "${{ env.LINUX_DIR }}"
+
+          make olddefconfig
+          make -j$(nproc)
+
+          echo "kernelversion=$(make kernelversion)" >> "$GITHUB_OUTPUT"
+          echo "version=$(make kernelversion)${{ env.LOCALVERSION }}" >> "$GITHUB_OUTPUT"
+
+      - name: install-linux
+        run: |
+          MODULE_DIR="${{ env.LINUX_OUT_DIR }}/usr/lib/modules/${{ steps.linux.outputs.version }}"
+
+          cd "${{ env.LINUX_DIR }}"
+
+          install -Dm644 arch/riscv/boot/Image.gz "${{ env.LINUX_OUT_DIR }}/boot/vmlinuz-${{ steps.linux.outputs.version }}"
+          make modules_install INSTALL_MOD_PATH="${{ env.LINUX_OUT_DIR }}/usr"
+          make dtbs_install INSTALL_DTBS_PATH="${{ env.LINUX_OUT_DIR }}/boot/dtbs/${{ steps.linux.outputs.version }}"
+          make dtbs_install INSTALL_DTBS_PATH="${{ env.LINUX_OUT_DIR }}/usr/lib/linux-image-${{ steps.linux.outputs.version }}"
+
+      - name: archive-linux
+        run: |
+          sudo chown -R 0:0 "${{ env.LINUX_OUT_DIR }}"
+          tar -czf "linux-image-${{ steps.linux.outputs.version }}.tar.gz" -C "${{ env.LINUX_OUT_DIR }}" .
+
+      - name: build-extra
+        id: extra
+        run: |
+          # JPU
+          cd "${{ env.EXTRA_DIR }}/codaj12/jdi/linux/driver"
+          make KERNELDIR="${{ env.LINUX_DIR }}" -j$(nproc)
+
+          # VENC
+          cd "${{ env.EXTRA_DIR }}/wave420l/code/vdi/linux/driver"
+          make KERNELDIR="${{ env.LINUX_DIR }}" -j$(nproc)
+
+          # VDEC
+          cd "${{ env.EXTRA_DIR }}/wave511/code/vdi/linux/driver"
+          make KERNELDIR="${{ env.LINUX_DIR }}" -j$(nproc)
+
+      - name: install-extra
+        run: |
+          MODULE_EXTRA_DIR="${{ env.EXTRA_OUT_DIR }}/usr/lib/modules/${{ steps.linux.outputs.version }}/extra"
+
+          # JPU
+          cd "${{ env.EXTRA_DIR }}/codaj12/jdi/linux/driver"
+          install -Dm644 jpu.ko "$MODULE_EXTRA_DIR/jpu.ko"
+
+          # VENC
+          cd "${{ env.EXTRA_DIR }}/wave420l/code/vdi/linux/driver"
+          install -Dm644 venc.ko "$MODULE_EXTRA_DIR/venc.ko"
+          install -Dm644 "${{ env.EXTRA_DIR }}/wave420l/firmware/monet.bin" "${{ env.EXTRA_OUT_DIR }}/usr/lib/firmware/monet.bin"
+          install -Dm644 "${{ env.EXTRA_DIR }}/wave420l/code/cfg/encoder_defconfig.cfg" "${{ env.EXTRA_OUT_DIR }}/usr/lib/firmware/encoder_defconfig.cfg"
+
+          # VDEC
+          cd "${{ env.EXTRA_DIR }}/wave511/code/vdi/linux/driver"
+          install -Dm644 vdec.ko "$MODULE_EXTRA_DIR/vdec.ko"
+          install -Dm644 "${{ env.EXTRA_DIR }}/wave511/firmware/chagall.bin" "${{ env.EXTRA_OUT_DIR }}/usr/lib/firmware/chagall.bin"
+
+      - name: archive-extra
+        run: |
+          sudo chown -R 0:0 "${{ env.EXTRA_OUT_DIR }}"
+          tar -czf "linux-extra-${{ steps.linux.outputs.version }}.tar.gz" -C "${{ env.EXTRA_OUT_DIR }}" .
+
+      - name: upload-artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-${{ steps.linux.outputs.version }}
+          path: |
+            linux-image-*.tar.gz
+            linux-extra-*.tar.gz
+          if-no-files-found: error
